@@ -12,7 +12,8 @@ Capabilities (one service section per feature):
   8. Unified multimodal analysis POST /api/multimodal/analyze
   9. Dashboard insights          GET  /api/insights/dashboard
 
-Reasoning engine: Anthropic Claude on Amazon Bedrock (vision + text) via boto3.
+Reasoning engine: Google Gemini (vision + text) via the google-genai SDK.
+API key:          st.secrets["GEMINI_API_KEY"] (.streamlit/secrets.toml), env var as fallback.
 Computer vision:  OpenCV / NumPy (local freshness heuristics + video frame sampling).
 Audio:            optional faster-whisper (local speech-to-text).
 
@@ -46,12 +47,8 @@ load_dotenv()
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-# Any Bedrock model that supports the Converse API with image input.
-# Use an inference-profile ID (e.g. "us.anthropic.claude-...") if your region requires it.
-BEDROCK_MODEL_ID = os.getenv(
-    "BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"
-)
+# Any Gemini model that supports image input (e.g. gemini-2.5-flash, gemini-2.5-pro).
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "8"))
 MAX_VIDEO_MB = int(os.getenv("MAX_VIDEO_MB", "100"))
@@ -83,21 +80,42 @@ def record(kind: str, summary: Dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# LLM reasoning engine (Amazon Bedrock Converse API)
+# LLM reasoning engine (Google Gemini)
 # --------------------------------------------------------------------------- #
-_bedrock_client = None
+_gemini_client = None
 
 
-def bedrock():
-    global _bedrock_client
-    if _bedrock_client is None:
+def get_api_key() -> str:
+    """Read the Gemini key from st.secrets["GEMINI_API_KEY"] (falls back to the env var)."""
+    key = None
+    try:
+        import streamlit as st
+
+        key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        key = None  # no secrets.toml or key missing
+    key = key or os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise HTTPException(
+            503,
+            'GEMINI_API_KEY not found. Create .streamlit/secrets.toml containing: GEMINI_API_KEY = "your-key" '
+            "(get a free key at https://aistudio.google.com/apikey).",
+        )
+    return key
+
+
+def gemini():
+    global _gemini_client
+    if _gemini_client is None:
         try:
-            import boto3
+            from google import genai
 
-            _bedrock_client = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+            _gemini_client = genai.Client(api_key=get_api_key())
+        except HTTPException:
+            raise
         except Exception as exc:  # pragma: no cover
-            raise HTTPException(503, f"AWS Bedrock client unavailable: {exc}")
-    return _bedrock_client
+            raise HTTPException(503, f"Gemini client unavailable: {exc}")
+    return _gemini_client
 
 
 def _image_format(data: bytes) -> str:
@@ -136,29 +154,37 @@ def ask_llm(
     temperature: float = 0.2,
 ) -> Dict[str, Any]:
     """Send text (+ optional images) to the model and return parsed JSON."""
-    content: List[Dict[str, Any]] = []
+    from google.genai import types
+
+    parts: List[Any] = []
     for img in images or []:
-        content.append({"image": {"format": _image_format(img), "source": {"bytes": img}}})
-    content.append({"text": prompt + "\n\nRespond with a single valid JSON object only. No markdown, no commentary."})
+        parts.append(types.Part.from_bytes(data=img, mime_type=f"image/{_image_format(img)}"))
+    parts.append(prompt + "\n\nRespond with a single valid JSON object only. No markdown, no commentary.")
 
     try:
-        resp = bedrock().converse(
-            modelId=BEDROCK_MODEL_ID,
-            system=[{"text": system}],
-            messages=[{"role": "user", "content": content}],
-            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
+        resp = gemini().models.generate_content(
+            model=GEMINI_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=temperature,
+                # Gemini 2.5 models spend part of this budget on internal thinking, so leave headroom.
+                max_output_tokens=max_tokens + 4096,
+                response_mime_type="application/json",
+            ),
         )
     except HTTPException:
         raise
     except Exception as exc:
-        log.exception("Bedrock call failed")
+        log.exception("Gemini call failed")
         raise HTTPException(
             503,
-            "AI reasoning engine unavailable. Check AWS credentials (`aws configure`), "
-            f"region and Bedrock model access. Details: {exc}",
+            "AI reasoning engine unavailable. Check your GEMINI_API_KEY, quota and model name. "
+            f"Details: {exc}",
         )
-    text = "".join(p.get("text", "") for p in resp["output"]["message"]["content"])
-    return parse_json(text)
+    if not resp.text:
+        raise HTTPException(502, "Gemini returned an empty response (it may have been blocked by safety filters).")
+    return parse_json(resp.text)
 
 
 SYSTEM_BASE = (
@@ -245,7 +271,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": BEDROCK_MODEL_ID, "region": AWS_REGION}
+    return {"status": "ok", "model": GEMINI_MODEL}
 
 
 # --------------------------------------------------------------------------- #
