@@ -1,3 +1,5 @@
+fastapi
+python-multipart
 streamlit
 google-generativeai
 Pillow
