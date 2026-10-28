@@ -1,12 +1,4 @@
-fastapi
-python-multipart
-streamlit
-google-generativeai
-Pillow
-numpy
-opencv-python-headless
-python-dotenv
-
-# Optional: local speech-to-text for audio inputs (large download, needs ffmpeg).
-# Uncomment to enable /api/audio/transcribe and audio in /api/multimodal/analyze.
-# faster-whisper>=1.0.3
+streamlit>=1.40.0
+google-genai>=1.0.0
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
